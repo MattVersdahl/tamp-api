@@ -92,7 +92,7 @@ def get_embedding(text):
     )
     return np.array(resp.data[0].embedding, dtype="float32")
 
-# ✅ NEW: Batched FAISS insert
+# ✅ Batched FAISS insert
 def add_to_faiss(chunks, batch_size=20):
     total_vectors = 0
     for i in range(0, len(chunks), batch_size):
@@ -291,6 +291,35 @@ def ask():
         return jsonify({"query": query, "results": results})
     except Exception as e:
         logging.error("❌ Fatal error in ask", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+# ✅ NEW conversational endpoint
+@app.route('/chat', methods=['POST'])
+def chat():
+    try:
+        data = request.get_json()
+        query = data.get("q")
+        if not query:
+            return jsonify({"error": "query required"}), 400
+
+        # Step 1: retrieve relevant chunks
+        results = search_faiss(query, top_k=5)
+        context = "\n\n".join([r["snippet"] for r in results])
+
+        # Step 2: ask GPT to answer
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant answering questions using TAMP documents. Always ground answers in provided context."},
+                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}
+            ],
+            max_tokens=300
+        )
+
+        answer = resp.choices[0].message.content
+        return jsonify({"query": query, "answer": answer, "sources": results})
+    except Exception as e:
+        logging.error("❌ Fatal error in chat", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @app.route('/checkOpenAI', methods=['GET'])
