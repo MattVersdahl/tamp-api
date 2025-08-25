@@ -3,15 +3,21 @@ from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-import io, os, json, logging, fitz, datetime
-import sqlite3
+import io
+import json
+import os
+import logging
+import fitz  # PyMuPDF
+import datetime
 from dotenv import load_dotenv
+import sqlite3
 from openai import OpenAI
 import faiss
 import numpy as np
 
 # Load .env for local dev
 load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
@@ -25,47 +31,24 @@ TOKEN_FILE = "token.json"
 
 CREDENTIALS = None
 
-# Embeddings + FAISS setup
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-EMBED_DIM = 1536  # ada-002 / gpt-4o-mini embeddings
-INDEX_FILE = "tamps.index"
-META_FILE = "tamps_meta.json"
-
-index = None
-metadata = []
-
-def embed_text(text):
-    """Get embedding vector from OpenAI"""
-    emb = client.embeddings.create(
-        model="text-embedding-ada-002",
-        input=text
-    ).data[0].embedding
-    return np.array(emb, dtype="float32")
-
-def load_faiss():
-    """Load FAISS index + metadata if available"""
-    global index, metadata
-    if os.path.exists(INDEX_FILE):
-        index = faiss.read_index(INDEX_FILE)
-        logging.info("✅ Loaded FAISS index")
-    else:
-        index = faiss.IndexFlatL2(EMBED_DIM)
-        logging.info("⚠️ No FAISS index found, created new one")
-    if os.path.exists(META_FILE):
-        with open(META_FILE, "r") as f:
-            metadata = json.load(f)
-        logging.info(f"✅ Loaded metadata: {len(metadata)} entries")
-    else:
-        metadata = []
-
-# Load FAISS at startup
-load_faiss()
-
-# ---------------- DB Setup (still store raw chunks for backup/debug) ----------------
+# SQLite DB
 DB_FILE = "tamps.db"
 
+# FAISS index
+FAISS_INDEX_FILE = "faiss.index"
+embedding_dim = 1536  # OpenAI text-embedding-3-small
+
+if os.path.exists(FAISS_INDEX_FILE):
+    index = faiss.read_index(FAISS_INDEX_FILE)
+    logging.info("✅ Loaded FAISS index from file")
+else:
+    index = faiss.IndexFlatL2(embedding_dim)
+    logging.warning("⚠️ No FAISS index found, created new one")
+
+# Embedding client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Init SQLite
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -92,9 +75,46 @@ def save_chunks_to_db(file_id, file_name, chunks):
     conn.commit()
     conn.close()
 
-# ---------------- Google Auth ----------------
+def chunk_text(text, chunk_size=2000, overlap=200):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        chunks.append(chunk)
+        start = end - overlap
+    return chunks
+
+def get_embedding(text):
+    resp = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text
+    )
+    return np.array(resp.data[0].embedding, dtype="float32")
+
+def add_to_faiss(chunks):
+    vectors = [get_embedding(c) for c in chunks]
+    index.add(np.vstack(vectors))
+    faiss.write_index(index, FAISS_INDEX_FILE)
+    return len(vectors)
+
+def search_faiss(query, top_k=5):
+    q_vec = get_embedding(query).reshape(1, -1)
+    distances, indices = index.search(q_vec, top_k)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    results = []
+    for idx in indices[0]:
+        if idx == -1:
+            continue
+        c.execute("SELECT file_name, chunk_text FROM chunks LIMIT 1 OFFSET ?", (idx,))
+        row = c.fetchone()
+        if row:
+            results.append({"fileName": row[0], "snippet": row[1][:500]})
+    conn.close()
+    return results
+
 def load_credentials():
-    """Always load credentials from token.json"""
     global CREDENTIALS
     if os.path.exists(TOKEN_FILE):
         try:
@@ -111,7 +131,6 @@ def load_credentials():
 
 load_credentials()
 
-# ---------------- Flask Routes ----------------
 @app.route('/authorize', methods=['GET'])
 def authorize():
     flow = Flow.from_client_config(
@@ -172,7 +191,7 @@ def status():
         "status": "ok",
         "credentials_loaded": CREDENTIALS is not None and CREDENTIALS.valid,
         "chunks_indexed": total_chunks,
-        "faiss_entries": len(metadata),
+        "faiss_entries": index.ntotal,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
     })
 
@@ -186,29 +205,14 @@ def list_tamps_pdfs():
         ).execute()
         return jsonify(results.get("files", []))
     except Exception as e:
-        logging.error(f"❌ Error listing PDFs: {e}")
+        logging.error(f"❌ Error listing PDFs: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
-
-def chunk_text(text, chunk_size=2000, overlap=200):
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start = end - overlap
-    return chunks
 
 @app.route('/buildIndex', methods=['POST'])
 def build_index():
-    global index, metadata
     try:
         if not CREDENTIALS or not CREDENTIALS.valid:
             return jsonify({"error": "Google credentials missing or invalid. Please re-authenticate at /authorize."}), 401
-
-        # reset
-        index = faiss.IndexFlatL2(EMBED_DIM)
-        metadata = []
 
         service = build("drive", "v3", credentials=CREDENTIALS)
         results = service.files().list(
@@ -217,10 +221,17 @@ def build_index():
         ).execute()
         files = results.get("files", [])
 
+        if not files:
+            return jsonify({"error": "No TAMP PDFs found in Google Drive"}), 404
+
+        docs_indexed = 0
+        chunks_indexed = 0
+
         for f in files:
             file_id = f["id"]
             name = f["name"]
 
+            logging.info(f"📄 Downloading {name}")
             request_drive = service.files().get_media(fileId=file_id)
             fh = io.BytesIO()
             downloader = MediaIoBaseDownload(fh, request_drive)
@@ -240,54 +251,41 @@ def build_index():
 
             chunks = chunk_text(text)
             save_chunks_to_db(file_id, name, chunks)
+            chunks_indexed += len(chunks)
+            docs_indexed += 1
 
-            # embed + add to FAISS
-            for chunk in chunks:
-                emb = embed_text(chunk)
-                index.add(np.array([emb]))
-                metadata.append({
-                    "fileId": file_id,
-                    "fileName": name,
-                    "snippet": chunk[:500]
-                })
-
-        # save FAISS + metadata
-        faiss.write_index(index, INDEX_FILE)
-        with open(META_FILE, "w") as f:
-            json.dump(metadata, f)
+            # Add to FAISS
+            add_to_faiss(chunks)
 
         return jsonify({
-            "documentsIndexed": len(files),
-            "chunksIndexed": len(metadata),
+            "documentsIndexed": docs_indexed,
+            "chunksIndexed": chunks_indexed,
             "message": "Index built and saved to FAISS"
         })
+
     except Exception as e:
-        logging.error(f"❌ Fatal error in buildIndex: {e}", exc_info=True)
+        logging.error("❌ Fatal error in buildIndex", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @app.route('/ask', methods=['POST'])
 def ask():
-    data = request.get_json()
-    query = data.get("q")
-    if not query:
-        return jsonify({"error": "query required"}), 400
-
-    # embed query
-    q_emb = embed_text(query)
-
-    # search in FAISS
-    D, I = index.search(np.array([q_emb]), k=5)  # top 5
-    results = []
-    for idx in I[0]:
-        if idx < len(metadata):
-            results.append(metadata[idx])
-
-    return jsonify({"query": query, "results": results})
+    try:
+        data = request.get_json()
+        query = data.get("q")
+        if not query:
+            return jsonify({"error": "query required"}), 400
+        results = search_faiss(query)
+        return jsonify({"query": query, "results": results})
+    except Exception as e:
+        logging.error("❌ Fatal error in ask", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/checkOpenAI', methods=['GET'])
 def check_openai():
-    if not OPENAI_API_KEY:
-        return jsonify({"error": "OPENAI_API_KEY not set"}), 500
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return jsonify({"error": "OPENAI_API_KEY not set in environment"}), 500
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
