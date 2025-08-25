@@ -92,11 +92,24 @@ def get_embedding(text):
     )
     return np.array(resp.data[0].embedding, dtype="float32")
 
-def add_to_faiss(chunks):
-    vectors = [get_embedding(c) for c in chunks]
-    index.add(np.vstack(vectors))
+# ✅ NEW: Batched FAISS insert
+def add_to_faiss(chunks, batch_size=20):
+    total_vectors = 0
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i+batch_size]
+        try:
+            resp = client.embeddings.create(
+                model="text-embedding-3-small",
+                input=batch
+            )
+            vectors = [np.array(item.embedding, dtype="float32") for item in resp.data]
+            index.add(np.vstack(vectors))
+            total_vectors += len(vectors)
+            logging.info(f"✅ Added {len(vectors)} vectors to FAISS (batch {i//batch_size + 1})")
+        except Exception as e:
+            logging.error(f"❌ Failed to embed batch {i//batch_size + 1}: {e}", exc_info=True)
     faiss.write_index(index, FAISS_INDEX_FILE)
-    return len(vectors)
+    return total_vectors
 
 def search_faiss(query, top_k=5):
     q_vec = get_embedding(query).reshape(1, -1)
@@ -254,7 +267,7 @@ def build_index():
             chunks_indexed += len(chunks)
             docs_indexed += 1
 
-            # Add to FAISS
+            # Add to FAISS with batching
             add_to_faiss(chunks)
 
         return jsonify({
