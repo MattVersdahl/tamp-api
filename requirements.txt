@@ -1,0 +1,9 @@
+flask
+google-auth
+google-auth-oauthlib
+google-api-python-client
+PyMuPDF
+gunicorn
+python-dotenv
+openai>=1.0.0
+faiss-cpu
