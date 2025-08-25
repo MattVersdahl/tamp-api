@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify, redirect
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 import fitz  # PyMuPDF
 import faiss
 import numpy as np
@@ -24,30 +25,107 @@ app = Flask(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 INDEX_FILE = "faiss.index"
 CORPUS_FILE = "corpus.pkl"
+
+# IDs for Drive-stored files (will be set after first upload)
+DRIVE_INDEX_FILE_ID = None
+DRIVE_CORPUS_FILE_ID = None
 
 # ---------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------
-if os.path.exists(INDEX_FILE):
-    index = faiss.read_index(INDEX_FILE)
-    logging.info("✅ FAISS index loaded")
-else:
-    index = faiss.IndexFlatL2(1536)
-    logging.warning("⚠️ No FAISS index found, created new one")
-
-if os.path.exists(CORPUS_FILE):
-    with open(CORPUS_FILE, "rb") as f:
-        corpus_texts = pickle.load(f)
-else:
-    corpus_texts = []
+index = faiss.IndexFlatL2(1536)
+corpus_texts = []
 
 creds = None
 if os.path.exists("token.json"):
     creds = Credentials.from_authorized_user_file("token.json", SCOPES)
     logging.info("✅ Loaded credentials from token.json")
+
+# ---------------------------------------------------------------------
+# Google Drive Helpers
+# ---------------------------------------------------------------------
+def get_drive_service():
+    global creds
+    if not creds:
+        return None
+    return build("drive", "v3", credentials=creds)
+
+def upload_to_drive(filename, filepath, mime_type="application/octet-stream"):
+    """Upload or overwrite a file in Google Drive"""
+    service = get_drive_service()
+    if not service:
+        return None
+
+    # Search if file already exists
+    results = service.files().list(q=f"name='{filename}'", fields="files(id, name)").execute()
+    files = results.get("files", [])
+
+    if files:
+        file_id = files[0]["id"]
+        media = MediaFileUpload(filepath, mimetype=mime_type, resumable=True)
+        updated = service.files().update(fileId=file_id, media_body=media).execute()
+        logging.info(f"♻️ Updated {filename} in Drive (ID {file_id})")
+        return updated["id"]
+    else:
+        file_metadata = {"name": filename}
+        media = MediaFileUpload(filepath, mimetype=mime_type, resumable=True)
+        file = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        logging.info(f"✅ Uploaded {filename} to Drive (ID {file['id']})")
+        return file["id"]
+
+def download_from_drive(filename, dest_path):
+    """Download a file by name from Google Drive"""
+    service = get_drive_service()
+    if not service:
+        return False
+
+    results = service.files().list(q=f"name='{filename}'", fields="files(id, name)").execute()
+    files = results.get("files", [])
+    if not files:
+        return False
+
+    file_id = files[0]["id"]
+    request = service.files().get_media(fileId=file_id)
+    fh = io.FileIO(dest_path, "wb")
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    logging.info(f"✅ Downloaded {filename} from Drive")
+    return True
+
+def save_index_and_corpus():
+    """Save FAISS + corpus locally and upload to Drive"""
+    faiss.write_index(index, INDEX_FILE)
+    with open(CORPUS_FILE, "wb") as f:
+        pickle.dump(corpus_texts, f)
+
+    upload_to_drive(INDEX_FILE, INDEX_FILE)
+    upload_to_drive(CORPUS_FILE, CORPUS_FILE)
+
+def load_index_and_corpus():
+    """Load FAISS + corpus from local or Drive"""
+    global index, corpus_texts
+    if os.path.exists(INDEX_FILE) and os.path.exists(CORPUS_FILE):
+        index = faiss.read_index(INDEX_FILE)
+        with open(CORPUS_FILE, "rb") as f:
+            corpus_texts = pickle.load(f)
+        logging.info("✅ Loaded FAISS + corpus from local files")
+        return True
+
+    # Try from Drive
+    if download_from_drive(INDEX_FILE, INDEX_FILE) and download_from_drive(CORPUS_FILE, CORPUS_FILE):
+        index = faiss.read_index(INDEX_FILE)
+        with open(CORPUS_FILE, "rb") as f:
+            corpus_texts = pickle.load(f)
+        logging.info("✅ Loaded FAISS + corpus from Drive")
+        return True
+
+    logging.warning("⚠️ No FAISS index found, starting empty")
+    return False
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -84,10 +162,7 @@ def add_to_faiss(chunks, batch_size=20):
         corpus_texts.extend(batch)
         logging.info(f"✅ Added {len(batch)} vectors to FAISS (batch {i//batch_size+1})")
 
-    # Save index + corpus
-    faiss.write_index(index, INDEX_FILE)
-    with open(CORPUS_FILE, "wb") as f:
-        pickle.dump(corpus_texts, f)
+    save_index_and_corpus()
 
 # ---------------------------------------------------------------------
 # Endpoints
@@ -142,7 +217,7 @@ def build_index():
         logging.info(f"📄 Downloading {file['name']}")
         request_dl = service.files().get_media(fileId=file["id"])
         fh = io.BytesIO()
-        downloader = build("drive", "v3", credentials=creds)._http.request(request_dl.uri)
+        downloader = service._http.request(request_dl.uri)
         fh.write(downloader[1])
         fh.seek(0)
 
@@ -216,4 +291,5 @@ def chat():
 # Run
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
+    load_index_and_corpus()
     app.run(host="0.0.0.0", port=10000)
